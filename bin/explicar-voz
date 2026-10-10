@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""explicar-voz (hermes-learn) — lee en voz alta un guion con Gemini 3.8 Flash TTS (streaming).
+
+Uso: explicar-voz guion.txt [salida.wav]
+  - Reproduce el audio mientras se genera (pw-cat), sin esperar al final.
+  - Guarda una copia .wav para volver a escucharla desde el HTML.
+  - Se puede cortar con: explicar-voz --stop   (o pkill -f explicar-voz)
+"""
+import base64, json, os, signal, struct, subprocess, sys, urllib.request
+
+MODEL = "gemini-3.8-flash-tts"
+
+def _conf():
+    f = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "hermes-learn", "config")
+    out = {}
+    if os.path.exists(f):
+        for line in open(f):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip().strip('"\'')
+    return out
+
+
+CONF = _conf()
+cfg = lambda k, d=None: os.environ.get(k) or CONF.get(k) or d
+MODEL = cfg("EXPLICAR_TTS_MODEL", MODEL)
+# Voz: un id de Voice design (voice_...) creado con scripts/create_voice.py,
+# o una voz prediseñada de Gemini. Si falla, se usa la de respaldo.
+VOICE = cfg("EXPLICAR_VOICE", "Leda")
+FALLBACK_VOICE = cfg("EXPLICAR_FALLBACK_VOICE", "Leda")  # "Youthful"
+STYLE = cfg("EXPLICAR_STYLE", "profesora joven y entusiasta explicando a un amigo, cálida, clara, "
+            "ritmo pausado y natural, con énfasis en las ideas clave")
+RATE = 24000
+PIDFILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "explicar", "voz.pid")
+
+
+def api_key():
+    k = cfg("GEMINI_API_KEY")
+    if k:
+        return k
+    for f in ("~/.config/environment.d/gemini.conf", "~/.hermes/.env"):  # sitios habituales
+        f = os.path.expanduser(f)
+        if os.path.exists(f):
+            for line in open(f):
+                if line.startswith("GEMINI_API_KEY="):
+                    return line.split("=", 1)[1].strip().strip('"\'')
+    sys.exit("explicar-voz: falta GEMINI_API_KEY")
+
+
+def stop_previous():
+    try:
+        pid = int(open(PIDFILE).read())
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except Exception:
+        pass
+
+
+def wav_header(n):
+    return (b"RIFF" + struct.pack("<I", 36 + n) + b"WAVEfmt " +
+            struct.pack("<IHHIIHH", 16, 1, 1, RATE, RATE * 2, 2, 16) +
+            b"data" + struct.pack("<I", n))
+
+
+def stream(text, voice):
+    body = {
+        "contents": [{"role": "user", "parts": [{"text": text, "speech_metadata": {"style": STYLE}}]}],
+        "generationConfig": {"responseModalities": ["AUDIO"],
+                             "speechConfig": {"voiceConfig": {"voice": voice}}},
+    }
+    req = urllib.request.Request(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:streamGenerateContent?alt=sse",
+        data=json.dumps(body).encode(), method="POST",
+        headers={"x-goog-api-key": api_key(), "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        for raw in r:
+            line = raw.decode("utf-8", "ignore").strip()
+            if not line.startswith("data:"):
+                continue
+            try:
+                ev = json.loads(line[5:])
+                for part in ev["candidates"][0]["content"]["parts"]:
+                    d = part.get("inlineData", {}).get("data")
+                    if d:
+                        yield base64.b64decode(d)
+            except (KeyError, IndexError, json.JSONDecodeError):
+                continue
+
+
+def main():
+    if sys.argv[1:2] == ["--stop"]:
+        stop_previous(); return
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    text = open(sys.argv[1], encoding="utf-8").read().strip()
+    out = sys.argv[2] if len(sys.argv) > 2 else None
+    if not text:
+        return
+    stop_previous()
+    os.makedirs(os.path.dirname(PIDFILE), exist_ok=True)
+    try:
+        os.setpgrp()
+    except PermissionError:
+        pass  # ya es líder de sesión (setsid)
+    open(PIDFILE, "w").write(str(os.getpid()))
+
+    player = subprocess.Popen(["pw-cat", "-p", "--raw", "--rate", str(RATE), "--channels", "1",
+                               "--format", "s16", "--media-role", "Communication", "-"],
+                              stdin=subprocess.PIPE)
+    pcm = bytearray()
+    signal.signal(signal.SIGTERM, lambda *a: (_ for _ in ()).throw(KeyboardInterrupt))
+    try:
+        _run(text, player, pcm)
+    except KeyboardInterrupt:
+        player.kill()
+    finally:
+        if out and pcm:
+            with open(out, "wb") as f:
+                f.write(wav_header(len(pcm)) + pcm)
+        try:
+            os.remove(PIDFILE)
+        except Exception:
+            pass
+    if not pcm:
+        sys.exit(1)
+
+
+def _run(text, player, pcm):
+    for voice in (VOICE, FALLBACK_VOICE):
+        try:
+            for chunk in stream(text, voice):
+                pcm += chunk
+                player.stdin.write(chunk); player.stdin.flush()
+            break
+        except urllib.error.HTTPError as e:
+            msg = e.read()[:300].decode("utf-8", "ignore")
+            print(f"explicar-voz: {voice} falló ({e.code}) {msg}", file=sys.stderr)
+            if pcm:
+                break
+        except BrokenPipeError:
+            break
+    try:
+        player.stdin.close()
+    except Exception:
+        pass
+    player.wait()
+
+
+if __name__ == "__main__":
+    main()

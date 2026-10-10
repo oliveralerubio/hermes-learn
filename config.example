@@ -1,0 +1,21 @@
+# hermes-learn — config (formato KEY=valor). Copiada a ~/.config/hermes-learn/config
+
+# Clave de Gemini para la voz (https://aistudio.google.com/apikey).
+# Puedes dejarla vacía si ya la tienes exportada en tu entorno.
+GEMINI_API_KEY=
+
+# Voz: id de Voice design (crea una con scripts/create_voice.py) o una voz
+# prediseñada de Gemini: Leda, Kore, Aoede, Achernar, Sulafat...
+EXPLICAR_VOICE=Leda
+#EXPLICAR_TTS_MODEL=gemini-3.8-flash-tts
+#EXPLICAR_STYLE=profesora joven y entusiasta explicando a un amigo, cálida y clara
+
+# Modelo que escribe la lámina y el guion (vía Hermes Agent)
+#EXPLICAR_MODEL=anthropic/claude-haiku-5.5
+#EXPLICAR_PROVIDER=nous
+
+# Carpeta del historial
+#EXPLICAR_DIR=$HOME/Explicaciones
+
+# 0 = solo HTML, sin voz
+#EXPLICAR_VOZ=1

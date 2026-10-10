@@ -1,0 +1,497 @@
+#!/usr/bin/env bash
+# explicar — hermes-learn
+# Explica lo último del portapapeles (texto o captura) con Hermes Agent como una
+# lámina HTML visual (Mermaid, pasos, tarjetas, temas) y, a la vez, una voz
+# (Gemini TTS) lee un guion pensado para el oído.
+# https://github.com/oliveralerubio/hermes-learn
+set -uo pipefail
+
+# Config: ~/.config/hermes-learn/config (formato KEY=valor) o variables de entorno
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/hermes-learn/config"
+[[ -f $CONF ]] && { set -a; . "$CONF"; set +a; }
+
+MODEL="${EXPLICAR_MODEL:-anthropic/claude-haiku-5.5}"
+PROVIDER="${EXPLICAR_PROVIDER:-nous}"
+OUT_DIR="${EXPLICAR_DIR:-$HOME/Explicaciones}"
+LIB="$OUT_DIR/.lib"          # mermaid, highlight.js y fuentes (locales, sin internet)
+WORK="${XDG_RUNTIME_DIR:-/tmp}/explicar"
+LOCK="$WORK/lock"
+mkdir -p "$OUT_DIR" "$WORK"
+if [[ ! -f $LIB/mermaid.min.js ]]; then
+  echo "explicar: faltan las librerías en $LIB — ejecuta ./install.sh" >&2
+fi
+
+notify() { omarchy-notification-send -g "󰧑" "$@" 2>/dev/null || notify-send "$@"; }
+
+# Evita dos explicaciones a la vez
+exec 9>"$LOCK"
+if ! flock -n 9; then notify "Explicar" "Ya estoy explicando algo, espera un momento"; exit 0; fi
+
+read -r -d '' PROMPT_BASE <<'PROMPT'
+Eres un profesor paciente. Explica en ESPAÑOL para alguien que no entendió esto.
+Responde SOLO con un fragmento HTML (sin <html>, <head>, <body>, <script> ni bloques ```).
+
+PRIMERO decide la complejidad:
+- SIMPLE (una palabra, un término, una frase corta, algo que se entiende en 3-4 frases):
+  usa hero, <p class="tldr"> y 1-2 <p> (y si quieres una pieza decorativa ligera). Nada de diagramas.
+- COMPLEJO (código, programación, arquitectura, procesos, comandos, errores, conceptos con partes):
+  la explicación debe ser VISUAL. Usa el texto solo para conectar las piezas. Incluye al menos
+  UN diagrama Mermaid y combina 2-4 de los componentes de abajo según lo que mejor enseñe.
+
+DISEÑO: sé CREATIVO, cada explicación debe verse distinta y con personalidad, como una lámina de clase bonita.
+La PRIMERA línea debe ser <meta name="tema" content="NOMBRE"> eligiendo el tema que mejor encaje con el asunto:
+  papel (cuaderno crema, serif; conceptos, historia, teoría)   pizarra (pizarra verde y tiza; matemáticas, lógica, clase)
+  blueprint (plano técnico azul; arquitectura, redes, sistemas) pastel (claro y amable; temas simples, idiomas, vida diaria)
+  neon (synthwave oscuro; frontend, diseño, cosas modernas)      revista (editorial blanco; comparaciones, ideas, debates)
+  terminal (fósforo verde retro; comandos, Linux, shell)       noche (oscuro elegante; lo demás)
+Varía: no uses siempre oscuro. Sugerencia para hoy si dudas: __TEMA_SUGERIDO__ (último usado: __TEMA_ULTIMO__, evita repetirlo).
+Opcional segunda línea: <meta name="acento" content="#rrggbb"> para cambiar el color principal si el tema lo pide
+(p. ej. azul de React, amarillo de JavaScript, naranja de Rust).
+Puedes añadir UN <style> corto (máx. 25 líneas) para toques propios, usando las variables
+var(--acc) var(--acc2) var(--fg) var(--bg) var(--card) var(--bd) var(--radius) var(--font-h) var(--font-mano); sin @import ni url().
+
+Estructura: empieza con un hero: <div class="hero"><span class="emoji">⚛️</span><h1>Título corto</h1></div>
+luego <p class="tldr"> con la idea en 1-2 frases, y después el contenido. Usa <mark> para resaltar 1-3 frases clave.
+
+COMPONENTES DISPONIBLES (ya tienen estilos y JS; úsalos tal cual):
+1) Diagrama Mermaid:  <pre class="mermaid">...código mermaid...</pre>
+   - flowchart TD / LR para flujos, decisiones y cómo se ejecuta el código
+   - sequenceDiagram para quién llama a quién (cliente/servidor, funciones, procesos)
+   - mindmap para mapas mentales de un concepto y sus partes
+   - classDiagram, stateDiagram-v2, erDiagram, gitGraph, timeline cuando aplique
+   Reglas Mermaid: pon las etiquetas entre comillas dobles, p. ej. A["Leer archivo"] --> B{"¿Existe?"};
+   NO uses los caracteres < > & ni comillas dentro de las etiquetas; máximo ~10 nodos por diagrama.
+   Prefiere flowchart TD (vertical): la ventana es estrecha. Usa LR solo con 4 nodos o menos.
+   Etiquetas cortas (2-5 palabras); si un diagrama crece mucho, divídelo en dos.
+   En mindmap: raíz como root((Concepto)) y nodos hijos indentados, sin comillas ni paréntesis extra.
+2) Pasos numerados:  <ol class="steps"><li><b>Título</b> explicación corta</li>...</ol>
+3) Tarjetas:  <div class="cards"><div class="card"><h3>Parte</h3><p>...</p></div>...</div>
+4) Pestañas (p. ej. "Diagrama / Código / Ejemplo"):
+   <div class="tabs"><section data-tab="Nombre">...</section><section data-tab="Otro">...</section></div>
+5) Código con resaltado: <pre><code class="language-python">...</code></pre> (escapa < > & como &lt; &gt; &amp;).
+   Puedes comentar líneas clave con comentarios dentro del propio código.
+6) Avisos: <div class="note">consejo</div>  <div class="warn">error típico o cuidado</div>
+7) Comparación: <table> con <th> (p. ej. antes/después, opción A vs B).
+8) Términos con tooltip: <abbr title="definición corta">término</abbr>
+9) Desplegable para detalle extra: <details><summary>Más a fondo</summary>...</details>
+10) Mini-quiz al final para comprobar: <details class="quiz"><summary>¿Pregunta?</summary>Respuesta</details>
+PIEZAS DECORATIVAS (dan vida; usa 1-3 que encajen, no todas):
+  <div class="analogia">una analogía de la vida real</div>
+  <div class="vs"><div><h3>A</h3>...</div><div><h3>B</h3>...</div></div>   (comparar dos cosas lado a lado)
+  <div class="stickies"><div class="sticky">idea corta</div>...</div>        (post-its con ideas clave)
+  <div class="stats"><div class="stat"><b>3×</b><span>más rápido</span></div>...</div>  (cifras grandes)
+  <ol class="timeline"><li><b>1995</b> qué pasó</li>...</ol>                 (historia, versiones, orden temporal)
+  <p class="mano">nota manuscrita al margen</p>                              (comentario informal de la profe)
+  <div class="ilustracion"><svg viewBox="0 0 400 160">...</svg></div>        (dibujo SVG simple tuyo: cajas,
+     círculos, flechas, iconos; usa fill/stroke con var(--acc), var(--acc2), var(--fg) y texto <text>.
+     Deja margen: que ningún <text> toque ni cruce una línea; centra el dibujo en el viewBox)
+  <kbd>Ctrl</kbd> para teclas.  En tarjetas puedes poner <span class="emoji">🔒</span> antes del <h3>.
+11) Terminal animada (se escribe sola) para comandos y su salida:
+   <pre class="term">$ comando
+salida del comando
+$ otro comando</pre>  (líneas que empiezan con "$ " se teclean; el resto aparece como salida)
+ANIMACIONES: son automáticas. Los diagramas Mermaid aparecen nodo a nodo con flechas en movimiento
+(define los nodos en el ORDEN en que ocurren las cosas) y los pasos <ol class="steps"> tienen un botón
+para reproducirlos uno a uno, así que para procesos secuenciales prefiere flowchart + steps.
+
+Máximo ~350 palabras de texto en total (el código y los diagramas no cuentan).
+Incluye al menos un ejemplo concreto. Sin preámbulos ni despedidas.
+
+DESPUÉS del HTML escribe una línea que diga exactamente ===GUION=== y debajo un GUION HABLADO.
+Lo leerá en voz alta una profesora joven mientras el alumno mira el HTML, al mismo tiempo.
+No es el mismo texto: está escrito para el oído, no para la vista.
+- Texto plano, sin HTML, sin markdown, sin listas, sin emojis ni símbolos.
+- Tono de profesora cercana hablándole a un amigo: frases cortas, naturales, con alguna pregunta retórica.
+- Acompaña lo visual: "fíjate en el diagrama", "en el primer paso", "en la tarjeta de la derecha"...
+- NO leas código ni comandos carácter por carácter: di qué hacen. Deletrea siglas solo si hace falta.
+- Escribe los números y símbolos como se dicen ("dos mil quinientos", "igual a", "punto json").
+- Puedes usar pausas <short pause> entre ideas y MAYÚSCULAS para enfatizar una palabra clave (con moderación).
+- Longitud: tema SIMPLE 30-60 palabras; tema COMPLEJO 120-220 palabras.
+- Termina con una frase corta que deje la idea clave clara.
+PROMPT
+
+types=$(wl-paste --list-types 2>/dev/null || true)
+img_args=()
+if grep -q '^image/' <<<"$types"; then
+  kind="captura"
+  wl-paste --type "$(grep -m1 '^image/' <<<"$types")" > "$WORK/clip.raw"
+  magick "$WORK/clip.raw" -resize '1400x1400>' "$WORK/clip.png" 2>/dev/null || cp "$WORK/clip.raw" "$WORK/clip.png"
+  img_args=(--image "$WORK/clip.png")
+  query="$PROMPT_BASE
+
+Explica lo que se ve en esta captura de pantalla (texto, error, código, gráfico o concepto que aparezca)."
+  preview="(captura de pantalla)"
+else
+  kind="texto"
+  text=$(wl-paste --no-newline 2>/dev/null || true)
+  if [[ -z "${text//[[:space:]]/}" ]]; then notify "Explicar" "El portapapeles está vacío"; exit 1; fi
+  text=${text:0:6000}
+  query="$PROMPT_BASE
+
+Texto a explicar:
+<<<
+$text
+>>>"
+  preview=${text:0:80}
+fi
+
+TEMAS=(papel pizarra blueprint pastel neon revista terminal noche)
+ultimo=$(cat "$WORK/ultimo_tema" 2>/dev/null || echo ninguno)
+sugerido=${TEMAS[RANDOM % ${#TEMAS[@]}]}
+[[ $sugerido == "$ultimo" ]] && sugerido=${TEMAS[(RANDOM+1) % ${#TEMAS[@]}]}
+query=${query//__TEMA_SUGERIDO__/$sugerido}
+query=${query//__TEMA_ULTIMO__/$ultimo}
+
+notify "Explicando ${kind}…" "$preview"
+
+raw=$(cd "$WORK" && timeout 180 hermes chat -Q --oneshot -m "$MODEL" --provider "$PROVIDER" -t "" \
+        "${img_args[@]}" -q "$query" 2>/dev/null)
+rc=$?
+# Quita la línea "session_id: ...", cercas ```html y cualquier <script> que se cuele
+raw=$(printf '%s\n' "$raw" | sed -E '/^session_id: /d; /^```(html|text)?[[:space:]]*$/d')
+body=$(printf '%s\n' "$raw" | sed '/^===GUION===/,$d' | sed -E 's#</?script[^>]*>##gI')
+guion=$(printf '%s\n' "$raw" | sed -n '/^===GUION===/,$p' | sed '1d')
+
+if [[ $rc -ne 0 || -z "${body//[[:space:]]/}" ]]; then
+  notify -u critical "Explicar: falló" "Hermes no respondió (código $rc)"
+  exit 1
+fi
+
+# Tema elegido por el modelo (validado) y color de acento opcional
+tema=$(grep -oP '<meta name="tema" content="\K[a-z]+' <<<"$body" | head -1)
+[[ " ${TEMAS[*]} " == *" $tema "* ]] || tema=$sugerido
+echo "$tema" > "$WORK/ultimo_tema"
+case $tema in papel|pastel|revista) dark=0;; *) dark=1;; esac
+acento=$(grep -oP '<meta name="acento" content="\K#[0-9a-fA-F]{6}' <<<"$body" | head -1)
+acento_css=""; [[ -n $acento ]] && acento_css="--acc:$acento"
+# Sin @import ni url() en el <style> del modelo
+body=$(printf '%s\n' "$body" | sed -E '/<meta name="(tema|acento)"/d; s/@import[^;]*;//gI; s/url\([^)]*\)/none/gI')
+
+stamp=$(date +%Y-%m-%d_%H%M%S)
+file="$OUT_DIR/$stamp.html"
+
+if [[ -n "${guion//[[:space:]]/}" ]]; then
+  printf '%s\n' "$guion" > "$OUT_DIR/$stamp.guion.txt"
+fi
+
+cat > "$file" <<EOF
+<!doctype html><html lang="es" data-tema="$tema" data-dark="$dark" style="$acento_css"><head><meta charset="utf-8">
+<title>Explicación</title>
+<link rel="stylesheet" href=".lib/fonts.css">
+<link rel="stylesheet" href=".lib/hljs-dark.css">
+<style>
+  /* ===== Temas: Haiku elige uno con <meta name="tema"> ===== */
+  :root{--font:"Inter",system-ui,sans-serif;--font-h:"Bricolage Grotesque","Inter",sans-serif;--font-mano:"Caveat",cursive;
+    --mono:"JetBrainsMono Nerd Font",ui-monospace,monospace;--radius:14px;--shadow:0 8px 28px rgba(0,0,0,.18);
+    --bgimg:none;--code-bg:#1b1d26;--code-fg:#e6e6ea;--on-acc:#111;--hl:rgba(255,214,10,.45);--dark:1;
+    --bg:#0f1117;--card:#181b24;--card2:#1f2330;--node:#232838;--fg:#e8eaf0;--mut:#9aa0ae;--acc:#f59e0b;--acc2:#8b5cf6;--ok:#34d399;--bad:#f87171;--bd:#2a2f3d}
+  [data-tema=noche]{--bgimg:radial-gradient(900px 500px at 85% -10%,color-mix(in srgb,var(--acc2) 22%,transparent),transparent 60%),radial-gradient(700px 400px at -10% 10%,color-mix(in srgb,var(--acc) 16%,transparent),transparent 60%)}
+  [data-tema=papel]{--dark:0;--bg:#f6f0e1;--card:#fffdf6;--card2:#f0e7d2;--node:#fff6dc;--fg:#2b2622;--mut:#7a6f62;--acc:#c2410c;--acc2:#1d4ed8;--ok:#15803d;--bad:#b91c1c;--bd:#e2d5b9;--on-acc:#fff;
+    --font:"Lora",Georgia,serif;--font-h:"Fraunces",Georgia,serif;--shadow:0 2px 0 #e2d5b9,0 8px 20px rgba(80,60,20,.10);
+    --bgimg:repeating-linear-gradient(0deg,transparent 0 31px,rgba(29,78,216,.07) 31px 32px),linear-gradient(90deg,transparent 0 46px,rgba(194,65,12,.18) 46px 48px,transparent 48px)}
+  [data-tema=pizarra]{--bg:#1e3a2c;--card:#24463a;--card2:#2b5244;--node:#2b5244;--fg:#f3f6ef;--mut:#bccbbd;--acc:#fde047;--acc2:#93c5fd;--ok:#86efac;--bad:#fca5a5;--bd:#6e8f80;--on-acc:#1e3a2c;
+    --font:"Nunito",sans-serif;--font-h:"Caveat",cursive;--radius:6px;--shadow:none;
+    --bgimg:radial-gradient(600px 300px at 20% 10%,rgba(255,255,255,.07),transparent 70%),radial-gradient(500px 300px at 90% 80%,rgba(255,255,255,.05),transparent 70%)}
+  [data-tema=blueprint]{--bg:#0d3b8c;--card:#114399;--card2:#164ea8;--node:#114399;--fg:#eaf2ff;--mut:#a9c1ea;--acc:#ffd166;--acc2:#7dd3fc;--ok:#6ee7b7;--bad:#fda4af;--bd:#7fa3df;--on-acc:#0d3b8c;
+    --font:"Space Grotesk",sans-serif;--font-h:"Space Grotesk",sans-serif;--radius:3px;--shadow:none;
+    --bgimg:linear-gradient(rgba(255,255,255,.10) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.10) 1px,transparent 1px),linear-gradient(rgba(255,255,255,.05) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.05) 1px,transparent 1px)}
+  [data-tema=blueprint] body{background-size:120px 120px,120px 120px,24px 24px,24px 24px}
+  [data-tema=pastel]{--dark:0;--bg:#fbf5ff;--card:#ffffff;--card2:#f4ebff;--node:#f4ebff;--fg:#2d2640;--mut:#7b7191;--acc:#8b5cf6;--acc2:#ec4899;--ok:#10b981;--bad:#ef4444;--bd:#e9dcff;--on-acc:#fff;
+    --font:"Nunito",sans-serif;--font-h:"Nunito",sans-serif;--radius:22px;--shadow:0 10px 30px rgba(139,92,246,.14);
+    --bgimg:radial-gradient(500px 340px at 0% 0%,#ffe4f3,transparent 70%),radial-gradient(520px 360px at 100% 10%,#dff3ff,transparent 70%),radial-gradient(600px 400px at 50% 110%,#e3fff1,transparent 70%)}
+  [data-tema=neon]{--bg:#0a0614;--card:#140d24;--card2:#1c1233;--node:#1c1233;--fg:#f5f3ff;--mut:#a79fc4;--acc:#ff2bd6;--acc2:#22d3ee;--ok:#4ade80;--bad:#fb7185;--bd:#3b2363;--on-acc:#0a0614;
+    --font:"Space Grotesk",sans-serif;--shadow:0 0 0 1px rgba(255,43,214,.25),0 0 28px rgba(255,43,214,.15);
+    --bgimg:radial-gradient(700px 420px at 100% 0%,rgba(255,43,214,.22),transparent 65%),radial-gradient(700px 420px at 0% 100%,rgba(34,211,238,.18),transparent 65%)}
+  [data-tema=revista]{--dark:0;--bg:#fafaf6;--card:#ffffff;--card2:#f1f0ea;--node:#ffffff;--fg:#121212;--mut:#666;--acc:#e11d48;--acc2:#0f172a;--ok:#047857;--bad:#b91c1c;--bd:#e3e2db;--on-acc:#fff;
+    --font:"Lora",Georgia,serif;--font-h:"Fraunces",Georgia,serif;--radius:4px;--shadow:none}
+  [data-tema=terminal]{--bg:#050a05;--card:#0a140a;--card2:#0f1d0f;--node:#0f1d0f;--fg:#b8f7b8;--mut:#5fae5f;--acc:#39ff14;--acc2:#ffb000;--ok:#39ff14;--bad:#ff5555;--bd:#1f4d1f;--on-acc:#050a05;
+    --font:var(--mono);--font-h:var(--mono);--radius:2px;--shadow:none;
+    --bgimg:repeating-linear-gradient(0deg,rgba(0,0,0,.25) 0 1px,transparent 1px 3px),radial-gradient(800px 500px at 50% 0%,rgba(57,255,20,.08),transparent 70%)}
+  [data-tema=terminal] body{text-shadow:0 0 6px rgba(57,255,20,.25);font-variant-ligatures:none}
+  [data-tema=terminal] .hero .emoji,[data-tema=terminal] .analogia::before,[data-tema=terminal] .card .emoji{filter:grayscale(1) sepia(1) hue-rotate(60deg) saturate(4) brightness(.9)}
+  [data-tema=terminal] .analogia{background-image:linear-gradient(var(--card),var(--card)),linear-gradient(120deg,var(--acc),var(--mut))}
+
+  /* ===== Base ===== */
+  *{box-sizing:border-box} html{background:var(--bg)}
+  body{margin:0 auto;padding:34px 38px 44px;color:var(--fg);font:17px/1.65 var(--font);max-width:900px;min-height:100vh;background-image:var(--bgimg);background-attachment:fixed}
+  h1,h2,h3{font-family:var(--font-h);line-height:1.15;letter-spacing:-.01em}
+  h1{font-size:2.1em;margin:0 0 .45em;color:var(--fg);font-weight:800}
+  h2{font-size:1.35em;margin:1.6em 0 .55em;color:var(--acc);font-weight:700}
+  h3{font-size:1.08em;margin:0 0 .3em;color:var(--acc)}
+  [data-tema=papel] h1{background:linear-gradient(transparent 62%,color-mix(in srgb,var(--acc) 28%,transparent) 62%);display:inline}
+  [data-tema=pizarra] h1,[data-tema=pizarra] h2{font-size:2.6em;color:var(--fg);font-weight:700} [data-tema=pizarra] h2{font-size:1.9em;color:var(--acc)}
+  [data-tema=neon] h1{background:linear-gradient(90deg,var(--acc),var(--acc2));-webkit-background-clip:text;background-clip:text;color:transparent}
+  [data-tema=revista] h1{font-size:2.8em;border-bottom:6px solid var(--fg);padding-bottom:.2em}
+  [data-tema=revista] h2{color:var(--fg);text-transform:uppercase;letter-spacing:.06em;font-size:1em;border-top:2px solid var(--fg);padding-top:.5em}
+  [data-tema=blueprint] h1,[data-tema=blueprint] h2{text-transform:uppercase;letter-spacing:.08em}
+  [data-tema=terminal] h1::before{content:"> ";color:var(--acc)}
+  p{margin:.6em 0} a{color:var(--acc)} li{margin:.3em 0} strong,b{color:var(--fg)}
+  .tldr{background:var(--card);border:1px solid var(--bd);border-left:6px solid var(--acc);padding:14px 18px;border-radius:var(--radius);font-size:1.08em;box-shadow:var(--shadow)}
+  [data-tema=pizarra] .tldr,[data-tema=pizarra] .card,[data-tema=pizarra] ol.steps>li{border-style:dashed}
+  mark{background:var(--hl);color:inherit;padding:.05em .25em;border-radius:4px;box-decoration-break:clone;-webkit-box-decoration-break:clone}
+  [data-dark="1"] mark{--hl:color-mix(in srgb,var(--acc) 35%,transparent)}
+  kbd{font:600 .85em var(--mono);background:var(--card2);border:1px solid var(--bd);border-bottom-width:3px;border-radius:6px;padding:1px 7px}
+  code{font-family:var(--mono);background:color-mix(in srgb,var(--acc) 14%,transparent);padding:1px 6px;border-radius:5px;font-size:.88em}
+  pre{position:relative;background:var(--code-bg);color:var(--code-fg);border:1px solid #2a2d3a;padding:14px 16px;border-radius:var(--radius);overflow:auto;box-shadow:var(--shadow);font-size:.9em}
+  pre code,pre code.hljs{background:none;padding:0;color:inherit}
+  .copy{position:absolute;top:6px;right:6px;background:#2a2d3a;color:#aaa;border:1px solid #3a3d4a;border-radius:6px;font:12px var(--font);padding:2px 8px;cursor:pointer;opacity:0;transition:.15s}
+  pre:hover .copy{opacity:1} .copy:hover{color:#fff}
+
+  /* ===== Piezas decorativas ===== */
+  .hero{display:flex;gap:20px;align-items:center;margin-bottom:1em}
+  .hero .emoji{font-size:72px;line-height:1;filter:drop-shadow(0 6px 14px rgba(0,0,0,.25));animation:flota 4s ease-in-out infinite}
+  .hero h1{margin:0}
+  @keyframes flota{50%{transform:translateY(-6px) rotate(-3deg)}}
+  .mano{font-family:var(--font-mano);font-size:1.5em;color:var(--acc2);transform:rotate(-2deg);display:inline-block;line-height:1.1;margin:.2em 0}
+  .mano::before{content:"↳ "}
+  .stickies{display:flex;flex-wrap:wrap;gap:16px;margin:1.2em 0}
+  .sticky{flex:1 1 180px;background:#fff59d;color:#3b3200;padding:16px 16px 20px;font-family:var(--font-mano);font-size:1.35em;line-height:1.25;box-shadow:0 10px 18px rgba(0,0,0,.18);transform:rotate(-1.5deg)}
+  .sticky:nth-child(2n){background:#ffccd5;color:#4a0d1a;transform:rotate(1.2deg)} .sticky:nth-child(3n){background:#c8f7dc;color:#063d22;transform:rotate(-.6deg)}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin:1.2em 0}
+  .stat{background:var(--card);border:1px solid var(--bd);border-radius:var(--radius);padding:14px;text-align:center;box-shadow:var(--shadow)}
+  .stat b{display:block;font:800 2.2em/1.1 var(--font-h);color:var(--acc)} .stat span{color:var(--mut);font-size:.9em}
+  .vs{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);gap:14px;align-items:stretch;margin:1.2em 0}
+  .vs>div{background:var(--card);border:1px solid var(--bd);border-radius:var(--radius);padding:14px 16px;box-shadow:var(--shadow)}
+  .vs>div:first-child{border-top:5px solid var(--acc)} .vs>div:last-child{border-top:5px solid var(--acc2)}
+  .vs::before{content:"VS";grid-column:2;grid-row:1;align-self:center;background:var(--fg);color:var(--bg);font:800 .9em var(--font-h);border-radius:50%;width:44px;height:44px;display:flex;align-items:center;justify-content:center}
+  .vs>div:first-child{grid-column:1;grid-row:1} .vs>div:last-child{grid-column:3;grid-row:1}
+  .analogia{position:relative;background:var(--card);border-radius:var(--radius);padding:16px 18px 16px 62px;margin:1.2em 0;border:2px solid transparent;
+    background-image:linear-gradient(var(--card),var(--card)),linear-gradient(120deg,var(--acc),var(--acc2));background-origin:border-box;background-clip:padding-box,border-box;box-shadow:var(--shadow)}
+  .analogia::before{content:"🧩";position:absolute;left:16px;top:14px;font-size:30px}
+  ol.timeline{list-style:none;padding:0 0 0 26px;margin:1.2em 0;border-left:3px solid var(--acc)}
+  ol.timeline>li{position:relative;margin:0 0 1em} ol.timeline>li::before{content:"";position:absolute;left:-35px;top:6px;width:15px;height:15px;border-radius:50%;background:var(--bg);border:3px solid var(--acc)}
+  ol.timeline>li>b:first-child{display:block;color:var(--acc);font-family:var(--font-h)}
+  .ilustracion{display:flex;justify-content:center;margin:1.2em 0} .ilustracion svg{max-width:100%;height:auto}
+
+  /* ===== Mermaid y visor ===== */
+  pre.mermaid{background:var(--card);color:var(--fg);text-align:center;padding:18px;cursor:zoom-in;border:1px solid var(--bd);overflow-x:auto;font-family:var(--font)}
+  pre.mermaid svg{max-width:100%;height:auto}
+  pre.mermaid .node rect,pre.mermaid .node polygon{stroke-width:2px} pre.mermaid .node rect{rx:10px;ry:10px} pre.mermaid .flowchart-link{stroke-width:2px}
+  pre.mermaid.ancho svg{max-width:none!important}
+  pre.mermaid.err{text-align:left;cursor:default;color:var(--mut);white-space:pre-wrap}
+  .zoom{position:fixed;inset:0;background:var(--bg);background-image:var(--bgimg);z-index:9;overflow:hidden;cursor:grab;user-select:none}
+  .zoom.drag{cursor:grabbing}
+  .zoom .lienzo{position:absolute;left:0;top:0;transform-origin:0 0;background:var(--card);border-radius:12px;padding:20px;box-shadow:0 10px 40px rgba(0,0,0,.35)}
+  .zoom .lienzo svg{display:block;max-width:none!important}
+  .zoom .barra{position:absolute;right:16px;top:14px;display:flex;gap:6px;z-index:2}
+  .zoom .barra button{background:var(--card2);color:var(--fg);border:1px solid var(--bd);border-radius:8px;font:inherit;min-width:36px;padding:4px 10px;cursor:pointer}
+  .zoom .barra button:hover{border-color:var(--acc);color:var(--acc)}
+  .zoom .ayuda{position:absolute;left:16px;bottom:12px;color:var(--mut);font-size:.8em}
+
+  /* ===== Componentes ===== */
+  ol.steps{list-style:none;counter-reset:s;padding:0}
+  ol.steps>li{counter-increment:s;position:relative;background:var(--card);border:1px solid var(--bd);border-radius:var(--radius);padding:12px 16px 12px 58px;margin:.7em 0;box-shadow:var(--shadow)}
+  ol.steps>li::before{content:counter(s);position:absolute;left:14px;top:12px;width:30px;height:30px;border-radius:50%;background:var(--acc);color:var(--on-acc);font:800 .95em var(--font-h);display:flex;align-items:center;justify-content:center}
+  ol.steps>li b:first-child{color:var(--acc);display:block;font-family:var(--font-h)}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin:1.2em 0}
+  .card{background:var(--card);border:1px solid var(--bd);border-radius:var(--radius);padding:14px 16px;transition:.2s;box-shadow:var(--shadow)}
+  .card:hover{border-color:var(--acc);transform:translateY(-3px) rotate(-.3deg)} .card p{margin:.25em 0}
+  .card .emoji{font-size:2em;display:block;margin-bottom:.2em}
+  .tabbar{display:flex;gap:6px;flex-wrap:wrap;margin:1.2em 0 0}
+  .tabbar button{background:var(--card);color:var(--mut);border:1px solid var(--bd);border-bottom:none;border-radius:10px 10px 0 0;padding:7px 16px;font:inherit;cursor:pointer}
+  .tabbar button.on{color:var(--on-acc);background:var(--acc);border-color:var(--acc)}
+  .tabs{background:var(--card);border:1px solid var(--bd);border-radius:0 var(--radius) var(--radius) var(--radius);padding:8px 18px;box-shadow:var(--shadow)}
+  .tabs>section{display:none} .tabs>section.on{display:block}
+  .note,.warn{padding:12px 16px 12px 48px;border-radius:var(--radius);margin:1.1em 0;position:relative}
+  .note{background:color-mix(in srgb,var(--ok) 14%,var(--card));border:1px solid color-mix(in srgb,var(--ok) 45%,transparent)}
+  .warn{background:color-mix(in srgb,var(--bad) 14%,var(--card));border:1px solid color-mix(in srgb,var(--bad) 45%,transparent)}
+  .note::before,.warn::before{position:absolute;left:15px;top:11px;font-size:1.2em} .note::before{content:"💡"} .warn::before{content:"⚠️"}
+  table{border-collapse:separate;border-spacing:0;width:100%;margin:1.1em 0;font-size:.95em;background:var(--card);border:1px solid var(--bd);border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow)}
+  th,td{padding:9px 12px;text-align:left;vertical-align:top;border-bottom:1px solid var(--bd)}
+  th{background:var(--acc);color:var(--on-acc);font-family:var(--font-h)} tr:last-child td{border-bottom:none}
+  tr:nth-child(even) td{background:color-mix(in srgb,var(--card2) 60%,transparent)}
+  abbr[title]{text-decoration:underline dotted var(--acc);text-underline-offset:3px;cursor:help}
+  details{background:var(--card);border:1px solid var(--bd);border-radius:var(--radius);padding:10px 16px;margin:.9em 0}
+  summary{cursor:pointer;color:var(--acc);font-weight:600}
+  details.quiz{border:2px dashed var(--acc2)} details.quiz summary{color:var(--acc2)}
+  details.quiz summary::before{content:"❓ "} details.quiz[open]{border-style:solid;border-color:var(--ok)}
+
+  /* ===== Animaciones ===== */
+  @keyframes fadeUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+  @keyframes fadeIn{from{opacity:0}to{opacity:1}}
+  @keyframes march{to{stroke-dashoffset:-20}}
+  @keyframes pulse{0%,100%{box-shadow:0 0 0 0 color-mix(in srgb,var(--acc) 40%,transparent)}50%{box-shadow:0 0 0 8px transparent}}
+  @keyframes blink{50%{opacity:0}}
+  .rv.in{animation:fadeUp .5s ease-out backwards}
+  .tldr.in{animation:fadeUp .5s ease-out backwards,pulse 1.6s .6s 2}
+  svg.anim .node,svg.anim .cluster,svg.anim .mindmap-node,svg.anim .actor,svg.anim .edgeLabel{opacity:0;animation:fadeIn .5s ease-out forwards}
+  svg.anim .flowchart-link,svg.anim path.relation,svg.anim .transition{stroke-dasharray:8 4;animation:march 1s linear infinite}
+  ol.steps>li{transition:background .3s,border-color .3s,transform .3s}
+  ol.steps>li.now{border-color:var(--acc);background:color-mix(in srgb,var(--acc) 14%,var(--card));transform:translateX(8px)}
+  ol.steps.playing>li:not(.now):not(.done){opacity:.45} ol.steps>li.done{opacity:1}
+  .play{background:var(--card);color:var(--acc);border:1.5px solid var(--acc);border-radius:20px;padding:4px 16px;font:inherit;font-size:.85em;cursor:pointer;margin:.3em 0}
+  .play:hover{background:var(--acc);color:var(--on-acc)}
+  pre,code,kbd{font-variant-ligatures:none}
+  pre.term{background:#0a0c0a;border-color:#263326;color:#cfe8cf;min-height:3em;font-family:var(--mono)}
+  pre.term .cmd{color:#4ade80} pre.term .cur{display:inline-block;width:.6em;background:#4ade80;animation:blink 1s steps(1) infinite}
+  .tabs>section.on{animation:fadeUp .35s ease-out}
+  details[open]>*:not(summary){animation:fadeUp .3s ease-out}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+  .meta{margin-top:2em;color:var(--mut);font-size:.78em;font-family:var(--font)}
+</style></head><body>
+<main>
+$body
+</main>
+<p class="meta">$(date '+%d/%m/%Y %H:%M') · $MODEL · tema $tema · clic en un diagrama para ampliarlo · Esc cierra y calla la voz</p>
+<script src=".lib/hljs.js"></script>
+<script src=".lib/mermaid.min.js"></script>
+<script>
+// Pestañas
+document.querySelectorAll('.tabs').forEach(t=>{
+  const secs=[...t.children].filter(e=>e.tagName==='SECTION'); if(!secs.length) return;
+  const bar=document.createElement('div'); bar.className='tabbar'; t.before(bar);
+  secs.forEach((s,i)=>{const b=document.createElement('button');b.textContent=s.dataset.tab||('Parte '+(i+1));
+    b.onclick=()=>{secs.forEach(x=>x.classList.remove('on'));bar.querySelectorAll('button').forEach(x=>x.classList.remove('on'));s.classList.add('on');b.classList.add('on');window.dispatchEvent(new Event('resize'))};
+    bar.append(b); if(i===0){s.classList.add('on');b.classList.add('on')}});
+});
+// Código: resaltado + botón copiar
+document.querySelectorAll('main pre:not(.mermaid):not(.term)').forEach(p=>{
+  const c=p.querySelector('code'); if(c&&window.hljs) hljs.highlightElement(c);
+  const b=document.createElement('button'); b.className='copy'; b.textContent='copiar';
+  b.onclick=()=>{navigator.clipboard.writeText((c||p).innerText.replace(/copiar\$/,'')); b.textContent='¡copiado!'; setTimeout(()=>b.textContent='copiar',1200)};
+  p.append(b);
+});
+// ===== Animaciones =====
+const reduce=matchMedia('(prefers-reduced-motion: reduce)').matches;
+// Entrada al hacer scroll, escalonada
+// (sin IntersectionObserver: la ventana es pequeña y así nada se queda invisible)
+[...document.querySelectorAll('main > *')].forEach((el,i)=>{el.style.animationDelay=Math.min(i,8)*80+'ms';el.classList.add('rv','in')});
+// Pasos: botón para reproducir uno a uno
+document.querySelectorAll('ol.steps').forEach(ol=>{
+  const lis=[...ol.children]; if(lis.length<2) return;
+  const b=document.createElement('button'); b.className='play'; b.textContent='▶ Reproducir pasos'; ol.before(b);
+  let timer=null;
+  b.onclick=()=>{
+    clearInterval(timer); let i=0; ol.classList.add('playing'); lis.forEach(l=>l.classList.remove('now','done'));
+    const tick=()=>{ if(i>0) {lis[i-1].classList.remove('now');lis[i-1].classList.add('done')}
+      if(i>=lis.length){clearInterval(timer);ol.classList.remove('playing');b.textContent='↻ Repetir';return}
+      lis[i].classList.add('now'); lis[i].scrollIntoView({block:'nearest',behavior:'smooth'}); i++; };
+    b.textContent='⏸ …'; tick(); timer=setInterval(tick,1800);
+  };
+});
+// Terminal que se escribe sola
+document.querySelectorAll('pre.term').forEach(p=>{
+  const lines=p.textContent.replace(/\s+$/,'').split('\n'); p.textContent='';
+  const run=async()=>{
+    p.textContent=''; const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+    for(const ln of lines){
+      const row=document.createElement('div'); p.append(row);
+      if(ln.startsWith('$ ')){
+        const c=document.createElement('span'); c.className='cmd'; row.append(c);
+        const cur=document.createElement('span'); cur.className='cur'; cur.innerHTML='&nbsp;'; row.append(cur);
+        for(const ch of ln){c.textContent+=ch; await sleep(reduce?0:35)}
+        await sleep(350); cur.remove();
+      } else { row.textContent=ln; await sleep(reduce?0:120); }
+    }
+  };
+  const o=new IntersectionObserver(es=>{if(es[0].isIntersecting){o.disconnect();run()}}); o.observe(p);
+  const b=document.createElement('button'); b.className='play'; b.textContent='↻ Repetir'; b.onclick=run; p.after(b);
+});
+// Diagramas: nodos aparecen en orden y las flechas se mueven
+function animarDiagrama(el){
+  const svg=el.querySelector('svg'); if(!svg||reduce) return;
+  svg.classList.add('anim');
+  svg.querySelectorAll('.node,.cluster,.mindmap-node,.actor').forEach((n,i)=>n.style.animationDelay=(i*140)+'ms');
+  svg.querySelectorAll('.edgeLabel').forEach((n,i)=>n.style.animationDelay=(300+i*140)+'ms');
+}
+// Mermaid (si un diagrama tiene errores, se muestra su código en vez de romper la página)
+(async()=>{
+  if(!window.mermaid) return;
+  await document.fonts.ready;
+  const cs=getComputedStyle(document.documentElement), V=k=>cs.getPropertyValue(k).trim();
+  mermaid.initialize({startOnLoad:false,theme:'base',securityLevel:'loose',fontFamily:V('--font'),
+    themeVariables:{darkMode:V('--dark')==='1',background:V('--card'),fontSize:'17px',fontFamily:V('--font'),
+      primaryColor:V('--node'),primaryBorderColor:V('--acc'),primaryTextColor:V('--fg'),textColor:V('--fg'),
+      secondaryColor:V('--card2'),secondaryBorderColor:V('--acc2'),secondaryTextColor:V('--fg'),
+      tertiaryColor:V('--card'),tertiaryBorderColor:V('--bd'),tertiaryTextColor:V('--fg'),
+      mainBkg:V('--node'),nodeBorder:V('--acc'),nodeTextColor:V('--fg'),lineColor:V('--acc'),
+      edgeLabelBackground:V('--card2'),clusterBkg:V('--card2'),clusterBorder:V('--bd'),titleColor:V('--fg'),
+      noteBkgColor:V('--card2'),noteTextColor:V('--fg'),noteBorderColor:V('--acc2'),
+      actorBkg:V('--node'),actorBorder:V('--acc'),actorTextColor:V('--fg'),actorLineColor:V('--mut'),
+      signalColor:V('--fg'),signalTextColor:V('--fg'),labelBoxBkgColor:V('--node'),labelBoxBorderColor:V('--acc'),
+      labelTextColor:V('--fg'),loopTextColor:V('--fg'),activationBkgColor:V('--card2'),activationBorderColor:V('--acc'),
+      git0:V('--acc'),git1:V('--acc2'),git2:V('--ok'),git3:V('--bad')}});
+  // Hace visibles temporalmente las pestañas para que Mermaid pueda medir el texto
+  const hidden=[...document.querySelectorAll('.tabs>section:not(.on)')]; hidden.forEach(s=>s.style.display='block');
+  let n=0;
+  const ancho=el=>el.clientWidth-34;
+  const escala=el=>{const v=el.querySelector('svg')?.viewBox?.baseVal; return v&&v.width?ancho(el)/v.width:1};
+  for(const el of document.querySelectorAll('pre.mermaid')){
+    let src=el.textContent.trim();
+    try{
+      let {svg}=await mermaid.render('m'+(n++),src); el.innerHTML=svg;
+      // Si un diagrama horizontal no cabe y quedaría diminuto, se redibuja en vertical
+      if(escala(el)<0.8 && /^(flowchart|graph)\s+(LR|RL)/.test(src)){
+        const src2=src.replace(/^(flowchart|graph)\s+(LR|RL)/,'flowchart TD');
+        const r2=await mermaid.render('m'+(n++),src2); const viejo=el.innerHTML, e1=escala(el);
+        el.innerHTML=r2.svg; if(escala(el)<e1){el.innerHTML=viejo}else{src=src2}
+      }
+      // Nunca encoger por debajo de ~85%: mejor scroll horizontal que letra ilegible
+      const sv=el.querySelector('svg'), v=sv.viewBox.baseVal;
+      if(v.width && escala(el)<0.85){ el.classList.add('ancho'); sv.style.width=(v.width*0.9)+'px'; sv.style.height='auto'; }
+      animarDiagrama(el);
+    }catch(e){ el.classList.add('err'); el.textContent='(no se pudo dibujar este diagrama)\n\n'+src; }
+  }
+  hidden.forEach(s=>s.style.display='');
+  document.querySelectorAll('pre.mermaid:not(.err)').forEach(el=>{
+    el.title='Clic para ampliar'; el.onclick=()=>abrirVisor(el.querySelector('svg'));
+  });
+})();
+
+// Visor a pantalla completa: rueda = zoom, arrastrar = mover, 0 = ajustar
+function abrirVisor(svgOrig){
+  if(!svgOrig) return;
+  const v=svgOrig.viewBox.baseVal, W=v.width||svgOrig.getBBox().width, H=v.height||svgOrig.getBBox().height;
+  const z=document.createElement('div'); z.className='zoom';
+  z.innerHTML='<div class="barra"><button data-a="menos">−</button><button data-a="ajustar">ajustar</button><button data-a="mas">+</button><button data-a="cerrar">✕</button></div><div class="ayuda">rueda: zoom · arrastrar: mover · 0: ajustar · Esc: cerrar</div><div class="lienzo"></div>';
+  const lz=z.querySelector('.lienzo'); const sv=svgOrig.cloneNode(true);
+  sv.removeAttribute('style'); sv.setAttribute('width',W); sv.setAttribute('height',H); sv.classList.remove('anim');
+  lz.append(sv); document.body.append(z);
+  let k=1,x=0,y=0;
+  const pintar=()=>{lz.style.transform='translate('+x+'px,'+y+'px) scale('+k+')'};
+  const ajustar=()=>{const bw=W+40,bh=H+40; k=Math.min(z.clientWidth*0.94/bw,(z.clientHeight-70)*0.94/bh,3);
+    x=(z.clientWidth-bw*k)/2; y=Math.max(50,(z.clientHeight-bh*k)/2); pintar()};
+  const zoomEn=(f,cx,cy)=>{const nk=Math.min(8,Math.max(0.2,k*f)); x=cx-(cx-x)*nk/k; y=cy-(cy-y)*nk/k; k=nk; pintar()};
+  z.addEventListener('wheel',e=>{e.preventDefault(); zoomEn(e.deltaY<0?1.15:1/1.15,e.clientX,e.clientY)},{passive:false});
+  let d=null;
+  z.addEventListener('pointerdown',e=>{if(e.target.closest('.barra'))return; d={sx:e.clientX-x,sy:e.clientY-y}; z.classList.add('drag'); z.setPointerCapture(e.pointerId)});
+  z.addEventListener('pointermove',e=>{if(d){x=e.clientX-d.sx; y=e.clientY-d.sy; pintar()}});
+  z.addEventListener('pointerup',()=>{d=null; z.classList.remove('drag')});
+  z.addEventListener('dblclick',e=>zoomEn(1.6,e.clientX,e.clientY));
+  const cerrar=()=>{z.remove(); removeEventListener('resize',ajustar); if(document.fullscreenElement) document.exitFullscreen().catch(()=>{})};
+  z._cerrar=cerrar;
+  z.querySelector('.barra').onclick=e=>{const a=e.target.dataset.a, c=[z.clientWidth/2,z.clientHeight/2];
+    if(a==='mas')zoomEn(1.3,...c); if(a==='menos')zoomEn(1/1.3,...c); if(a==='ajustar')ajustar(); if(a==='cerrar')cerrar()};
+  addEventListener('resize',ajustar);
+  // La ventanita es pequeña: el visor pasa a pantalla completa
+  (document.documentElement.requestFullscreen?document.documentElement.requestFullscreen():Promise.reject()).catch(()=>{}).finally(()=>setTimeout(ajustar,120));
+  ajustar(); sv.classList.add('anim');
+}
+addEventListener('keydown',e=>{const z=document.querySelector('.zoom'); if(!z) return;
+  if(e.key==='+'||e.key==='=') z.querySelector('[data-a=mas]').click();
+  if(e.key==='-') z.querySelector('[data-a=menos]').click();
+  if(e.key==='0') z.querySelector('[data-a=ajustar]').click();
+});
+document.addEventListener('fullscreenchange',()=>{ if(!document.fullscreenElement){const z=document.querySelector('.zoom'); if(z) setTimeout(()=>z.querySelector('[data-a=ajustar]')?.click(),100)} });
+addEventListener('keydown',e=>{if(e.key==='Escape'){const z=document.querySelector('.zoom'); z?z._cerrar():window.close()}});
+</script>
+</body></html>
+EOF
+
+# Voz (Gemini TTS) y ventana arrancan a la vez
+if [[ -f "$OUT_DIR/$stamp.guion.txt" && ${EXPLICAR_VOZ:-1} != 0 ]]; then
+  setsid -f explicar-voz "$OUT_DIR/$stamp.guion.txt" "$OUT_DIR/$stamp.wav" >>"$WORK/voz.log" 2>&1 9>&-
+fi
+setsid -f chromium --app="file://$file" >/dev/null 2>&1 9>&-
+
+# Si cierras la ventana (Esc / Super+W) la voz se calla
+(
+  pat="${stamp}.html"; seen=0
+  for _ in $(seq 1 900); do
+    sleep 1
+    if hyprctl clients -j 2>/dev/null | grep -q "$pat"; then seen=1
+    elif (( seen )); then explicar-voz --stop; break; fi
+    pgrep -f "explicar-voz .*$stamp" >/dev/null || (( ! seen )) || break
+  done
+) >/dev/null 2>&1 9>&- &
+disown

@@ -1,0 +1,4 @@
+*.wav
+voz_preview.wav
+__pycache__/
+.env
