@@ -113,6 +113,10 @@ def main():
         _run(text, player, pcm)
     except KeyboardInterrupt:
         player.kill()
+        try:
+            player.stdin = None  # evita BrokenPipe al cerrar
+        except Exception:
+            pass
     finally:
         if out and pcm:
             with open(out, "wb") as f:
