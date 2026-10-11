@@ -113,10 +113,14 @@ def main():
         _run(text, player, pcm)
     except KeyboardInterrupt:
         player.kill()
+        # Cerrar ya: si se deja al recolector, el flush contra el pipe muerto
+        # imprime "Exception ignored ... BrokenPipeError". close() cierra el fd
+        # aunque el flush falle.
         try:
-            player.stdin = None  # evita BrokenPipe al cerrar
-        except Exception:
+            player.stdin.close()
+        except OSError:
             pass
+        player.wait()
     finally:
         if out and pcm:
             with open(out, "wb") as f:
